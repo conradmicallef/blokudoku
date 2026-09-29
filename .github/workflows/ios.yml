@@ -1,0 +1,36 @@
+name: iOS
+
+on:
+  push:
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  pull_request:
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build and test (simulator, unsigned)
+        run: |
+          DEVICE=$(xcrun simctl list devices available | grep -m1 -o 'iPhone [^(]*' | sed 's/ *$//')
+          echo "Using simulator: $DEVICE"
+          set -o pipefail
+          xcodebuild test \
+            -project Blokudoku.xcodeproj \
+            -scheme Blokudoku \
+            -destination "platform=iOS Simulator,name=$DEVICE" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO | tail -n 60
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blokudoku-simulator-app
+          path: ios/build/Build/Products/Debug-iphonesimulator/Blokudoku.app
