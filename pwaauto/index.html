@@ -1,0 +1,40 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Blokudoku Auto</title>
+<meta name="theme-color" content="#1b2a4a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app">
+  <header>
+    <div class="stat"><span class="label">Score</span><span id="score">0</span></div>
+    <div class="stat right"><span class="label">Best</span><span id="best">0</span></div>
+  </header>
+  <div id="combo" aria-live="polite"></div>
+  <div id="board" role="grid" aria-label="Game board"></div>
+  <div id="tray">
+    <div class="slot" data-i="0"></div>
+    <div class="slot" data-i="1"></div>
+    <div class="slot" data-i="2"></div>
+  </div>
+  <div class="row"><button id="pause" type="button">Pause</button><button id="speed" type="button">Speed: normal</button><button id="newgame" type="button">New game</button></div>
+</main>
+<div id="overlay" hidden>
+  <div class="card">
+    <h2>Game over</h2>
+    <p>Score <b id="final">0</b></p>
+    <p id="newbest" hidden>New best!</p>
+    <button id="again" type="button">Play again</button>
+  </div>
+</div>
+<script src="game.js"></script>
+</body>
+</html>
