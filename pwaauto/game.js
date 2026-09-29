@@ -238,21 +238,38 @@ let speedIdx = 1, paused = false, botTimer = null;
 // The bot plans the whole set of pieces at once: beam search over every order
 // and placement, scored by points gained plus how healthy the resulting board is.
 // Only the first move of the best plan is played, then it re-plans.
+// Weights were tuned by self-play (evolution strategy) on hard, pre-filled boards.
 const BEAM = 16;
-const GROUPS = (() => {
-  const g = [];
-  for (let i = 0; i < N; i++) {
-    const row = [], col = [], box = [];
-    const br = (i / 3 | 0) * 3, bc = (i % 3) * 3;
-    for (let j = 0; j < N; j++) {
-      row.push(i * N + j);
-      col.push(j * N + i);
-      box.push((br + (j / 3 | 0)) * N + bc + j % 3);
-    }
-    g.push(row, col, box);
+const W = {
+  blocked4: 10.32, blocked3: 7.56,      // empty cell walled in on 4 / 3 sides
+  smallRegion: 1.77, regionMax: 5,      // per missing cell of a tiny enclosed empty region
+  rough: 0.96, filled: 1.17,            // ragged edges, occupied cells
+  nearComplete: 2.02, nearMin: 7,       // groups close to clearing
+  mobility: 1.6, dead: 150, clearMul: 0.83,
+};
+
+// Every legal placement of each shape, as flat board indices.
+const PLACEMENTS = SHAPES.map(cells => {
+  const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
+  const out = [];
+  for (let r = 0; r <= N - h; r++) for (let c = 0; c <= N - w; c++) {
+    out.push({ r, c, idx: cells.map(([dr, dc]) => (r + dr) * N + c + dc) });
   }
-  return g;
-})();
+  return out;
+});
+
+// Groups 0-8 rows, 9-17 columns, 18-26 boxes; and the three groups each cell belongs to.
+const GC = [];
+for (let i = 0; i < N; i++) GC.push([...Array(N).keys()].map(j => i * N + j));
+for (let i = 0; i < N; i++) GC.push([...Array(N).keys()].map(j => j * N + i));
+for (let i = 0; i < N; i++) {
+  const br = (i / 3 | 0) * 3, bc = (i % 3) * 3;
+  GC.push([...Array(N).keys()].map(j => (br + (j / 3 | 0)) * N + bc + j % 3));
+}
+const CG = [...Array(N * N).keys()].map(k => {
+  const r = k / N | 0, c = k % N;
+  return [r, N + c, 2 * N + (r / 3 | 0) * 3 + (c / 3 | 0)];
+});
 
 // Board quality after a move (higher is better). b is a flat 81-cell array of 0/1.
 function boardScore(b) {
@@ -261,10 +278,9 @@ function boardScore(b) {
   for (let i = 0; i < N * N; i++) {
     if (b[i]) { filled++; continue; }
     const r = i / N | 0, c = i % N;
-    const up = r === 0 || b[i - N], down = r === N - 1 || b[i + N];
-    const left = c === 0 || b[i - 1], right = c === N - 1 || b[i + 1];
-    const blocked = up + down + left + right;
-    if (blocked === 4) s -= 14; else if (blocked === 3) s -= 5;
+    const blocked = (r === 0 || b[i - N] ? 1 : 0) + (r === N - 1 || b[i + N] ? 1 : 0) +
+                    (c === 0 || b[i - 1] ? 1 : 0) + (c === N - 1 || b[i + 1] ? 1 : 0);
+    if (blocked === 4) s -= W.blocked4; else if (blocked === 3) s -= W.blocked3;
     if (seen[i]) continue;
     // Small enclosed empty regions can only take tiny pieces.
     let size = 0;
@@ -279,17 +295,18 @@ function boardScore(b) {
       if (kc > 0 && !b[k - 1] && !seen[k - 1]) { seen[k - 1] = 1; stack.push(k - 1); }
       if (kc < N - 1 && !b[k + 1] && !seen[k + 1]) { seen[k + 1] = 1; stack.push(k + 1); }
     }
-    if (size < 5) s -= (5 - size) * 4;
+    if (size < W.regionMax) s -= (W.regionMax - size) * W.smallRegion;
   }
+  let rough = 0;
   for (let i = 0; i < N * N; i++) {
-    if (i % N < N - 1 && !b[i] !== !b[i + 1]) s -= 0.6;
-    if (i < N * (N - 1) && !b[i] !== !b[i + N]) s -= 0.6;
+    if (i % N < N - 1 && b[i] !== b[i + 1]) rough++;
+    if (i < N * (N - 1) && b[i] !== b[i + N]) rough++;
   }
-  s -= filled * 0.8;
-  for (const g of GROUPS) {
+  s -= rough * W.rough + filled * W.filled;
+  for (const g of GC) {
     let n = 0;
     for (const k of g) n += b[k];
-    if (n >= 7 && n < N) s += (n - 6) * 1.5; // close to clearing
+    if (n >= W.nearMin && n < N) s += (n - W.nearMin + 1) * W.nearComplete;
   }
   return s;
 }
@@ -297,53 +314,47 @@ function boardScore(b) {
 // How many of the possible shapes could still be placed: a measure of how much room is left.
 function mobility(b) {
   let n = 0;
-  for (const cells of SHAPES) {
-    const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
-    let ok = false;
-    for (let r = 0; r <= N - h && !ok; r++) for (let c = 0; c <= N - w && !ok; c++) {
-      ok = cells.every(([dr, dc]) => !b[(r + dr) * N + c + dc]);
-    }
-    if (ok) n++;
-  }
+  for (const pls of PLACEMENTS) if (pls.some(pl => pl.idx.every(k => !b[k]))) n++;
   return n;
 }
 
-function applyMove(b, p, r, c) {
+function applyMove(b, pl) {
   const t = b.slice();
-  p.cells.forEach(([dr, dc]) => { t[(r + dr) * N + c + dc] = 1; });
-  const full = GROUPS.filter(g => g.every(k => t[k]));
-  full.forEach(g => g.forEach(k => { t[k] = 0; }));
+  let mask = 0;
+  for (const k of pl.idx) { t[k] = 1; mask |= (1 << CG[k][0]) | (1 << CG[k][1]) | (1 << CG[k][2]); }
+  const full = [];
+  for (let g = 0; g < 27; g++) if (mask & (1 << g) && GC[g].every(k => t[k])) full.push(g);
+  full.forEach(g => GC[g].forEach(k => { t[k] = 0; }));
   return { b: t, n: full.length };
 }
 
 function smartMove() {
-  const idx = [];
-  pieces.forEach((p, i) => { if (p) idx.push(i); });
-  if (!idx.length) return null;
-  const size = idx.map(i => dims(pieces[i]));
-  let states = [{ b: Uint8Array.from(grid.flat(), v => v ? 1 : 0), used: 0, gain: 0, first: null, val: 0 }];
+  const set = [];
+  pieces.forEach((p, slot) => { if (p) set.push({ slot, s: SHAPES.indexOf(p.cells), len: p.cells.length }); });
+  if (!set.length) return null;
+  let states = [{ b: Uint8Array.from(grid.flat(), v => v ? 1 : 0), used: 0, gain: 0, combo, first: null, val: 0 }];
   const done = [];
-  for (let level = 0; level < idx.length; level++) {
+  for (let level = 0; level < set.length; level++) {
     const cand = new Map();
     for (const st of states) {
       let any = false;
-      idx.forEach((i, k) => {
-        if (st.used & (1 << i)) return;
-        const p = pieces[i], [h, w] = size[k];
-        for (let r = 0; r <= N - h; r++) for (let c = 0; c <= N - w; c++) {
-          if (!p.cells.every(([dr, dc]) => !st.b[(r + dr) * N + c + dc])) continue;
+      set.forEach((piece, k) => {
+        if (st.used & (1 << k)) return;
+        for (const pl of PLACEMENTS[piece.s]) {
+          if (!pl.idx.every(i => !st.b[i])) continue;
           any = true;
-          const { b, n } = applyMove(st.b, p, r, c);
-          const gain = st.gain + p.cells.length + (n ? 10 * n * n : 0);
-          const used = st.used | (1 << i);
-          const key = used + '|' + b.join('');
+          const { b, n } = applyMove(st.b, pl);
+          let gain = st.gain + piece.len, cmb = 0;
+          if (n) { cmb = st.combo + 1; gain += 10 * n * n * W.clearMul + st.combo * 10; }
+          const used = st.used | (1 << k);
+          const key = used + '|' + cmb + '|' + b.join('');
           const val = gain + boardScore(b);
           const old = cand.get(key);
-          if (!old || val > old.val) cand.set(key, { b, used, gain, val, first: st.first || { i, r, c } });
+          if (!old || val > old.val) cand.set(key, { b, used, gain, combo: cmb, val, first: st.first || { i: piece.slot, r: pl.r, c: pl.c } });
         }
       });
       // Could not place every piece: heavily penalised dead end.
-      if (!any) done.push({ ...st, val: st.gain + boardScore(st.b) - 150 * (idx.length - level) });
+      if (!any) done.push({ ...st, val: st.gain + boardScore(st.b) - W.dead * (set.length - level) });
     }
     states = [...cand.values()].sort((x, y) => y.val - x.val).slice(0, BEAM);
     if (!states.length) break;
@@ -351,7 +362,7 @@ function smartMove() {
   let best = null;
   for (const st of states.concat(done)) {
     if (!st.first) continue;
-    const v = st.val + mobility(st.b) * 1.2;
+    const v = st.val + mobility(st.b) * W.mobility;
     if (!best || v > best.v) best = { v, ...st.first };
   }
   return best;
