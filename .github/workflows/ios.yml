@@ -14,7 +14,7 @@ jobs:
       run:
         working-directory: ios
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
@@ -30,7 +30,7 @@ jobs:
             -destination "platform=iOS Simulator,name=$DEVICE" \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO | tail -n 60
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: blokudoku-simulator-app
           path: ios/build/Build/Products/Debug-iphonesimulator/Blokudoku.app
