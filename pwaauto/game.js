@@ -235,42 +235,125 @@ document.addEventListener('contextmenu', e => e.preventDefault());
 const SPEEDS = [['slow', 1200], ['normal', 600], ['fast', 320], ['turbo', 0]];
 let speedIdx = 1, paused = false, botTimer = null;
 
-// Heuristic value of a grid after a move: reward cleared groups and open space,
-// punish jagged surfaces and cells that are boxed in.
-function evalGrid(g, cleared) {
-  let empty = 0, pockets = 0, edges = 0;
-  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-    if (g[r][c]) continue;
-    empty++;
-    let filled = 0;
-    [[1,0],[-1,0],[0,1],[0,-1]].forEach(([dr, dc]) => {
-      const rr = r + dr, cc = c + dc;
-      if (rr < 0 || rr >= N || cc < 0 || cc >= N || g[rr][cc]) filled++;
-    });
-    if (filled >= 3) pockets++;
-    edges += filled;
+// The bot plans the whole set of pieces at once: beam search over every order
+// and placement, scored by points gained plus how healthy the resulting board is.
+// Only the first move of the best plan is played, then it re-plans.
+const BEAM = 16;
+const GROUPS = (() => {
+  const g = [];
+  for (let i = 0; i < N; i++) {
+    const row = [], col = [], box = [];
+    const br = (i / 3 | 0) * 3, bc = (i % 3) * 3;
+    for (let j = 0; j < N; j++) {
+      row.push(i * N + j);
+      col.push(j * N + i);
+      box.push((br + (j / 3 | 0)) * N + bc + j % 3);
+    }
+    g.push(row, col, box);
   }
-  return cleared * 40 + empty * 2 - pockets * 6 - edges;
+  return g;
+})();
+
+// Board quality after a move (higher is better). b is a flat 81-cell array of 0/1.
+function boardScore(b) {
+  let s = 0, filled = 0;
+  const seen = new Uint8Array(N * N);
+  for (let i = 0; i < N * N; i++) {
+    if (b[i]) { filled++; continue; }
+    const r = i / N | 0, c = i % N;
+    const up = r === 0 || b[i - N], down = r === N - 1 || b[i + N];
+    const left = c === 0 || b[i - 1], right = c === N - 1 || b[i + 1];
+    const blocked = up + down + left + right;
+    if (blocked === 4) s -= 14; else if (blocked === 3) s -= 5;
+    if (seen[i]) continue;
+    // Small enclosed empty regions can only take tiny pieces.
+    let size = 0;
+    const stack = [i];
+    seen[i] = 1;
+    while (stack.length) {
+      const k = stack.pop();
+      size++;
+      const kr = k / N | 0, kc = k % N;
+      if (kr > 0 && !b[k - N] && !seen[k - N]) { seen[k - N] = 1; stack.push(k - N); }
+      if (kr < N - 1 && !b[k + N] && !seen[k + N]) { seen[k + N] = 1; stack.push(k + N); }
+      if (kc > 0 && !b[k - 1] && !seen[k - 1]) { seen[k - 1] = 1; stack.push(k - 1); }
+      if (kc < N - 1 && !b[k + 1] && !seen[k + 1]) { seen[k + 1] = 1; stack.push(k + 1); }
+    }
+    if (size < 5) s -= (5 - size) * 4;
+  }
+  for (let i = 0; i < N * N; i++) {
+    if (i % N < N - 1 && !b[i] !== !b[i + 1]) s -= 0.6;
+    if (i < N * (N - 1) && !b[i] !== !b[i + N]) s -= 0.6;
+  }
+  s -= filled * 0.8;
+  for (const g of GROUPS) {
+    let n = 0;
+    for (const k of g) n += b[k];
+    if (n >= 7 && n < N) s += (n - 6) * 1.5; // close to clearing
+  }
+  return s;
 }
 
-function bestMove() {
-  let best = null;
-  pieces.forEach((p, i) => {
-    if (!p) return;
-    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-      if (!canPlace(p, r, c)) continue;
-      const t = grid.map(row => row.slice());
-      p.cells.forEach(([dr, dc]) => { t[r + dr][c + dc] = 1; });
-      const groups = fullGroups(t);
-      groups.flat().forEach(k => { t[k / N | 0][k % N] = 0; });
-      let v = evalGrid(t, groups.length);
-      // keep the other pieces placeable
-      const saved = grid; grid = t;
-      pieces.forEach((q, j) => { if (q && j !== i && !fitsAnywhere(q)) v -= 60; });
-      grid = saved;
-      if (!best || v > best.v) best = { v, i, r, c };
+// How many of the possible shapes could still be placed: a measure of how much room is left.
+function mobility(b) {
+  let n = 0;
+  for (const cells of SHAPES) {
+    const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
+    let ok = false;
+    for (let r = 0; r <= N - h && !ok; r++) for (let c = 0; c <= N - w && !ok; c++) {
+      ok = cells.every(([dr, dc]) => !b[(r + dr) * N + c + dc]);
     }
-  });
+    if (ok) n++;
+  }
+  return n;
+}
+
+function applyMove(b, p, r, c) {
+  const t = b.slice();
+  p.cells.forEach(([dr, dc]) => { t[(r + dr) * N + c + dc] = 1; });
+  const full = GROUPS.filter(g => g.every(k => t[k]));
+  full.forEach(g => g.forEach(k => { t[k] = 0; }));
+  return { b: t, n: full.length };
+}
+
+function smartMove() {
+  const idx = [];
+  pieces.forEach((p, i) => { if (p) idx.push(i); });
+  if (!idx.length) return null;
+  const size = idx.map(i => dims(pieces[i]));
+  let states = [{ b: Uint8Array.from(grid.flat(), v => v ? 1 : 0), used: 0, gain: 0, first: null, val: 0 }];
+  const done = [];
+  for (let level = 0; level < idx.length; level++) {
+    const cand = new Map();
+    for (const st of states) {
+      let any = false;
+      idx.forEach((i, k) => {
+        if (st.used & (1 << i)) return;
+        const p = pieces[i], [h, w] = size[k];
+        for (let r = 0; r <= N - h; r++) for (let c = 0; c <= N - w; c++) {
+          if (!p.cells.every(([dr, dc]) => !st.b[(r + dr) * N + c + dc])) continue;
+          any = true;
+          const { b, n } = applyMove(st.b, p, r, c);
+          const gain = st.gain + p.cells.length + (n ? 10 * n * n : 0);
+          const used = st.used | (1 << i);
+          const key = used + '|' + b.join('');
+          const val = gain + boardScore(b);
+          const old = cand.get(key);
+          if (!old || val > old.val) cand.set(key, { b, used, gain, val, first: st.first || { i, r, c } });
+        }
+      });
+      // Could not place every piece: heavily penalised dead end.
+      if (!any) done.push({ ...st, val: st.gain + boardScore(st.b) - 150 * (idx.length - level) });
+    }
+    states = [...cand.values()].sort((x, y) => y.val - x.val).slice(0, BEAM);
+    if (!states.length) break;
+  }
+  let best = null;
+  for (const st of states.concat(done)) {
+    if (!st.first) continue;
+    const v = st.val + mobility(st.b) * 1.2;
+    if (!best || v > best.v) best = { v, ...st.first };
+  }
   return best;
 }
 
@@ -279,7 +362,7 @@ function botStep() {
   if (paused) return;
   const delay = SPEEDS[speedIdx][1];
   if (over) { botTimer = setTimeout(() => { newGame(); botStep(); }, Math.max(delay, 300) * 2); return; }
-  const m = bestMove();
+  const m = smartMove();
   if (!m) { botTimer = setTimeout(botStep, 200); return; }
   const p = pieces[m.i];
   const show = () => p.cells.forEach(([dr, dc]) => cells[(m.r + dr) * N + m.c + dc].classList.add('preview'));
